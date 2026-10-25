@@ -9,7 +9,7 @@ import urllib.request
 import uuid
 from typing import Any
 
-_REASONING = re.compile(r"^\s*💭\s*\*\*Reasoning:\*\*\s*```.*?```\s*", re.DOTALL)
+_REASONING_HEAD = re.compile(r"^\s*💭\s*\*\*Reasoning:\*\*\s*\n```[^\n]*\n")
 
 TERMINAL_STATES = {
     "TASK_STATE_COMPLETED",
@@ -28,8 +28,24 @@ class A2AError(Exception):
 
 
 def strip_reasoning(text: str) -> str:
-    """Drop the reasoning block some agents (Hermes) put before the answer."""
-    return _REASONING.sub("", text, count=1)
+    """Drop the reasoning block some agents (Hermes) put before the answer.
+
+    The block is a fence; fences opened inside it (```python ... ```) are
+    skipped, so code in the reasoning does not end the block early.
+    """
+    head = _REASONING_HEAD.match(text)
+    if not head:
+        return text
+    lines = text[head.end():].split("\n")
+    inner = False
+    for i, line in enumerate(lines):
+        fence = line.strip()
+        if not fence.startswith("```"):
+            continue
+        if fence == "```" and not inner:
+            return "\n".join(lines[i + 1:]).lstrip()
+        inner = not inner if fence == "```" else True
+    return text  # unbalanced: keep everything rather than lose the answer
 
 
 def parts_text(parts: list[dict[str, Any]] | None) -> str:
@@ -44,12 +60,14 @@ def parts_text(parts: list[dict[str, Any]] | None) -> str:
 
 
 def task_reply(task: dict[str, Any]) -> str:
-    """Best-effort final text of a task: status message, else artifacts."""
-    message = (task.get("status") or {}).get("message") or {}
-    text = parts_text(message.get("parts"))
+    """Best-effort final text of a task: artifacts, else the status message."""
+    text = "\n".join(
+        t for t in (parts_text(a.get("parts")) for a in task.get("artifacts") or []) if t
+    )
     if text:
         return text
-    return "\n".join(parts_text(a.get("parts")) for a in task.get("artifacts") or [])
+    message = (task.get("status") or {}).get("message") or {}
+    return parts_text(message.get("parts"))
 
 
 class Client:
@@ -83,7 +101,19 @@ class Client:
             with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
                 data = json.load(resp)
         except urllib.error.HTTPError as exc:
-            raise A2AError(f"HTTP {exc.code} from {self.url}") from exc
+            # Peers often put a JSON-RPC error in the body of a 4xx/5xx reply.
+            detail = ""
+            try:
+                err = json.loads(exc.read() or b"{}").get("error")
+                if isinstance(err, dict):
+                    err = err.get("message", err)
+                if err:
+                    detail = f": {err}"
+            except (ValueError, AttributeError):
+                pass
+            finally:
+                exc.close()
+            raise A2AError(f"HTTP {exc.code} from {self.url}{detail}") from exc
         except (urllib.error.URLError, OSError) as exc:
             raise A2AError(f"cannot reach {self.url}: {exc}") from exc
         if "error" in data:

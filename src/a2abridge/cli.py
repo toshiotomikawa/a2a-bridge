@@ -7,6 +7,7 @@ import json
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from . import __version__, config, jobs, permissions
@@ -83,7 +84,9 @@ def cmd_card(args: argparse.Namespace) -> int:
     if args.target.startswith("http"):
         client = Client(args.target)
     else:
-        peer = cfg["peers"][args.target]
+        peer = cfg["peers"].get(args.target)
+        if peer is None:
+            raise A2AError(f"unknown peer '{args.target}'. Known: {', '.join(cfg['peers'])}")
         client = Client(peer["url"], config.peer_token(peer))
     print(json.dumps(client.card(), ensure_ascii=False, indent=2))
     return 0
@@ -106,7 +109,16 @@ def cmd_mcp(args: argparse.Namespace) -> int:
     return 0
 
 
+def _check_agent(name: str | None) -> None:
+    agents = config.load()["server"]["agents"]
+    if name is not None and name not in agents:
+        raise A2AError(f"unknown agent '{name}'. Known: {', '.join(agents)}")
+
+
 def cmd_grant(args: argparse.Namespace) -> int:
+    _check_agent(args.agent)
+    if args.dir and not Path(args.dir).expanduser().is_dir():
+        raise A2AError(f"folder {args.dir} does not exist")
     g = permissions.grant(args.agent, args.level, args.minutes, args.dir)
     until = datetime.fromtimestamp(g["expires"]).strftime("%H:%M")
     where = g["workdir"] or "any folder"
@@ -122,6 +134,7 @@ def cmd_grants(args: argparse.Namespace) -> int:
 
 
 def cmd_revoke(args: argparse.Namespace) -> int:
+    _check_agent(args.agent)
     print(f"revoked {permissions.revoke(args.agent)} grant(s)")
     return 0
 

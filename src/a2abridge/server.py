@@ -3,8 +3,9 @@
 Each configured agent (Claude Code, Codex, ...) gets its own port and
 Agent Card, so any A2A client can address it by URL. An A2A
 ``contextId`` maps to the agent's own session id, so a caller keeps one
-conversation across turns. Methods: SendMessage, GetTask, ListTasks,
-CancelTask (plus the pre-1.0 aliases).
+conversation across turns. Tasks and contexts belong to the peer that
+created them; other peers can neither see nor continue them. Methods:
+SendMessage, GetTask, ListTasks, CancelTask (plus the pre-1.0 aliases).
 """
 
 from __future__ import annotations
@@ -30,7 +31,9 @@ ALIASES = {
 }
 
 MAX_TASKS = 500
-DONE = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED"}
+MAX_BODY = 1_048_576
+DONE = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"}
+LOCAL_HOSTS = ("127.0.0.1", "localhost")
 
 FRAME = (
     "[Message from the A2A peer '{peer}', relayed by a2a-bridge. "
@@ -58,7 +61,7 @@ class AgentService:
         self.runner = RUNNERS[cfg.get("runner", name)]
         self.tasks: dict[str, dict[str, Any]] = {}
         self.turns: dict[str, Turn] = {}
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.context_locks: dict[str, threading.Lock] = {}
         self.slots = threading.Semaphore(int(server_cfg.get("max_concurrent", 2)))
         self.contexts_file = config.state_dir("contexts") / f"{name}.json"
@@ -66,6 +69,7 @@ class AgentService:
     # --- card ---------------------------------------------------------
 
     def card(self, base_url: str) -> dict[str, Any]:
+        secured = bool(self.server_cfg.get("tokens"))
         return {
             "name": self.cfg.get("name", self.name),
             "description": (
@@ -86,10 +90,9 @@ class AgentService:
                 "extendedAgentCard": False,
             },
             "securitySchemes": (
-                {"bearer": {"httpAuthSecurityScheme": {"scheme": "Bearer"}}}
-                if self.server_cfg.get("tokens")
-                else {}
+                {"bearer": {"httpAuthSecurityScheme": {"scheme": "Bearer"}}} if secured else {}
             ),
+            "security": [{"bearer": []}] if secured else [],
             "defaultInputModes": ["text/plain"],
             "defaultOutputModes": ["text/plain"],
             "skills": [
@@ -102,45 +105,50 @@ class AgentService:
             ],
         }
 
-    # --- contexts -----------------------------------------------------
+    # --- contexts (keyed by peer, so peers never share one) -----------
 
-    def _context(self, context_id: str) -> dict[str, Any]:
-        return config.read_json(self.contexts_file, {}).get(context_id, {})
+    def _context(self, key: str) -> dict[str, Any]:
+        return config.read_json(self.contexts_file, {}).get(key, {})
 
-    def _save_context(self, context_id: str, data: dict[str, Any]) -> None:
-        with self.lock:
+    def _save_context(self, key: str, data: dict[str, Any]) -> None:
+        with self.lock, config.locked(self.contexts_file):
             all_ctx = config.read_json(self.contexts_file, {})
-            all_ctx[context_id] = data
+            all_ctx[key] = data
             config.write_json(self.contexts_file, all_ctx)
 
     # --- methods ------------------------------------------------------
 
     def send_message(self, params: dict[str, Any], peer: str) -> dict[str, Any]:
-        message = params.get("message") or {}
-        text = parts_text(message.get("parts"))
-        if not text.strip():
+        message = params.get("message")
+        if not isinstance(message, dict):
+            raise RpcError(-32602, "params.message must be an object")
+        parts = message.get("parts")
+        text = parts_text(parts if isinstance(parts, list) else [])
+        body, _ = permissions.parse_directives(text)
+        if not body.strip():
             raise RpcError(-32602, "message has no text")
-        context_id = message.get("contextId") or f"ctx-{uuid.uuid4().hex}"
-        task_id = f"task-{uuid.uuid4().hex[:16]}"
-        conf = params.get("configuration") or {}
+        context_id = str(message.get("contextId") or f"ctx-{uuid.uuid4().hex}")
+        conf = params.get("configuration")
+        conf = conf if isinstance(conf, dict) else {}
         background = conf.get("returnImmediately") or conf.get("blocking") is False
+        meta = message.get("metadata")
         task = {
-            "id": task_id,
+            "id": f"task-{uuid.uuid4().hex[:16]}",
             "contextId": context_id,
             "status": {"state": "TASK_STATE_SUBMITTED", "timestamp": _now()},
-            "history": [message],
             "metadata": {"peer": peer},
         }
         with self.lock:
-            self.tasks[task_id] = task
-            self.turns[task_id] = Turn()
+            self.tasks[task["id"]] = task
+            self.turns[task["id"]] = Turn()
             # Keep memory bounded: forget the oldest finished tasks.
             finished = [k for k, t in self.tasks.items() if t["status"]["state"] in DONE]
             for old in finished[: max(0, len(self.tasks) - MAX_TASKS)]:
                 self.tasks.pop(old, None)
                 self.turns.pop(old, None)
         worker = threading.Thread(
-            target=self._execute, args=(task, text, message.get("metadata") or {}, peer),
+            target=self._execute,
+            args=(task, text, meta if isinstance(meta, dict) else {}, peer),
             daemon=True,
         )
         worker.start()
@@ -149,48 +157,61 @@ class AgentService:
         return self._public(task)
 
     def _execute(self, task: dict[str, Any], text: str, meta: dict[str, Any], peer: str) -> None:
-        context_id = task["contextId"]
+        key = f"{peer}:{task['contextId']}"
         with self.lock:
-            ctx_lock = self.context_locks.setdefault(context_id, threading.Lock())
+            ctx_lock = self.context_locks.setdefault(key, threading.Lock())
         with ctx_lock, self.slots:
-            turn = self.turns[task["id"]]
-            if turn.cancelled:
-                return
-            self._set_state(task, "TASK_STATE_WORKING")
+            with self.lock:
+                turn = self.turns.get(task["id"])
+                if turn is None or turn.cancelled:
+                    return
+                self._set_state(task, "TASK_STATE_WORKING")
             body, directives = permissions.parse_directives(text)
-            ctx = self._context(context_id)
+            ctx = self._context(key)
             level, folder, notes = permissions.resolve(
                 self.name,
                 self.cfg,
-                meta.get("permission") or directives.get("permission"),
-                meta.get("workdir") or directives.get("workdir") or ctx.get("workdir"),
+                str(meta.get("permission") or directives.get("permission") or "") or None,
+                str(meta.get("workdir") or directives.get("workdir") or "") or None,
+                current=ctx.get("workdir"),
             )
             # A session is tied to its folder; a new folder starts a new session.
             session = ctx.get("session") if ctx.get("workdir") == str(folder) else None
             note_text = (" Notes: " + "; ".join(notes) + ".") if notes else ""
             prompt = FRAME.format(peer=peer, level=level, folder=folder, notes=note_text) + body
             try:
-                reply, new_session = self.runner(turn, self.cfg, prompt, session, level, folder)
-            except RunError as exc:
-                state = "TASK_STATE_CANCELED" if turn.cancelled else "TASK_STATE_FAILED"
-                self._set_state(task, state, f"{self.name} failed: {exc}")
-                return
+                try:
+                    reply, new_session = self.runner(turn, self.cfg, prompt, session, level, folder)
+                except RunError:
+                    if not session or turn.cancelled:
+                        raise
+                    # The saved session may be gone; start a fresh one once.
+                    notes.append("previous session could not be resumed; started a new one")
+                    session = None
+                    reply, new_session = self.runner(turn, self.cfg, prompt, None, level, folder)
             except Exception as exc:  # noqa: BLE001 - report, never crash the server
-                self._set_state(task, "TASK_STATE_FAILED", f"{self.name} failed: {exc}")
+                with self.lock:
+                    if task["status"]["state"] not in DONE:
+                        state = "TASK_STATE_CANCELED" if turn.cancelled else "TASK_STATE_FAILED"
+                        self._set_state(task, state, f"{self.name} failed: {exc}")
                 return
             if new_session and new_session != session:
                 self._log_dispatch(peer, new_session)
             self._save_context(
-                context_id,
+                key,
                 {"session": new_session, "workdir": str(folder), "updated": _now(), "peer": peer},
             )
             if notes:
                 reply = f"[a2a-bridge: {'; '.join(notes)}]\n\n{reply}"
-            task["metadata"].update(permission=level, workdir=str(folder))
-            task["artifacts"] = [
-                {"artifactId": uuid.uuid4().hex, "parts": [{"text": reply, "mediaType": "text/plain"}]}
-            ]
-            self._set_state(task, "TASK_STATE_COMPLETED", reply)
+            with self.lock:
+                if turn.cancelled or task["status"]["state"] in DONE:
+                    return
+                task["metadata"].update(permission=level, workdir=str(folder))
+                task["artifacts"] = [{
+                    "artifactId": uuid.uuid4().hex,
+                    "parts": [{"text": reply, "mediaType": "text/plain"}],
+                }]
+                self._set_state(task, "TASK_STATE_COMPLETED", reply)
 
     def _set_state(self, task: dict[str, Any], state: str, text: str | None = None) -> None:
         status: dict[str, Any] = {"state": state, "timestamp": _now()}
@@ -215,34 +236,50 @@ class AgentService:
             fh.write(json.dumps(line) + "\n")
 
     def _public(self, task: dict[str, Any]) -> dict[str, Any]:
-        return {k: v for k, v in task.items() if k != "history"}
+        with self.lock:
+            return json.loads(json.dumps(task))
 
-    def get_task(self, params: dict[str, Any]) -> dict[str, Any]:
-        task = self.tasks.get(params.get("id", ""))
-        if not task:
+    def _own(self, params: dict[str, Any], peer: str) -> dict[str, Any]:
+        task = self.tasks.get(str(params.get("id", "")))
+        if not task or task["metadata"].get("peer") != peer:
             raise RpcError(-32001, "task not found")
-        return self._public(task)
+        return task
 
-    def list_tasks(self, params: dict[str, Any]) -> dict[str, Any]:
+    def get_task(self, params: dict[str, Any], peer: str) -> dict[str, Any]:
+        with self.lock:
+            return self._public(self._own(params, peer))
+
+    def list_tasks(self, params: dict[str, Any], peer: str) -> dict[str, Any]:
         ctx = params.get("contextId")
-        found = [self._public(t) for t in self.tasks.values() if not ctx or t["contextId"] == ctx]
+        try:
+            size = max(1, min(200, int(params.get("pageSize") or 50)))
+        except (TypeError, ValueError):
+            raise RpcError(-32602, "pageSize must be a number")
+        with self.lock:
+            found = [
+                self._public(t)
+                for t in self.tasks.values()
+                if t["metadata"].get("peer") == peer and (not ctx or t["contextId"] == ctx)
+            ]
         found.reverse()
-        return {"tasks": found[: int(params.get("pageSize") or 50)]}
+        return {"tasks": found[:size]}
 
-    def cancel_task(self, params: dict[str, Any]) -> dict[str, Any]:
-        task = self.tasks.get(params.get("id", ""))
-        if not task:
-            raise RpcError(-32001, "task not found")
-        if task["status"]["state"] in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED"):
-            raise RpcError(-32002, "task cannot be canceled")
-        self.turns[task["id"]].cancel()
-        self._set_state(task, "TASK_STATE_CANCELED", "canceled by the caller")
+    def cancel_task(self, params: dict[str, Any], peer: str) -> dict[str, Any]:
+        with self.lock:
+            task = self._own(params, peer)
+            if task["status"]["state"] in DONE:
+                raise RpcError(-32002, "task cannot be canceled")
+            turn = self.turns.get(task["id"])
+            self._set_state(task, "TASK_STATE_CANCELED", "canceled by the caller")
+        if turn:
+            turn.cancel()
         return self._public(task)
 
 
 def make_handler(service: AgentService, tokens: dict[str, str]):
     class Handler(BaseHTTPRequestHandler):
         server_version = "a2a-bridge/" + __version__
+        timeout = 30  # seconds per socket read; long turns run on worker threads
 
         def log_message(self, fmt: str, *args: Any) -> None:  # quiet by default
             pass
@@ -255,19 +292,24 @@ def make_handler(service: AgentService, tokens: dict[str, str]):
             self.end_headers()
             self.wfile.write(data)
 
+        def _rpc_error(self, rid: Any, code: int, message: str) -> None:
+            self._send(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}})
+
         def _peer(self) -> str | None:
             if not tokens:
                 return "local"
             auth = self.headers.get("Authorization", "")
             given = auth[7:] if auth.lower().startswith("bearer ") else ""
             for name, token in tokens.items():
-                if given and hmac.compare_digest(given, token):
+                if given and hmac.compare_digest(given.encode(), token.encode()):
                     return name
             return None
 
         def do_GET(self) -> None:  # noqa: N802
             if self.path.split("?")[0] in ("/.well-known/agent-card.json", "/.well-known/agent.json"):
                 host, port = self.server.server_address[:2]
+                if host in ("0.0.0.0", ""):
+                    host = (self.headers.get("Host") or "127.0.0.1").split(":")[0]
                 self._send(200, service.card(f"http://{host}:{port}/"))
             else:
                 self._send(404, {"error": "not found"})
@@ -279,33 +321,44 @@ def make_handler(service: AgentService, tokens: dict[str, str]):
                 return
             try:
                 length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > MAX_BODY:
+                self._send(413, {"error": "request too large"})
+                return
+            try:
                 req = json.loads(self.rfile.read(length) or b"{}")
-            except (ValueError, json.JSONDecodeError):
-                self._send(200, {"jsonrpc": "2.0", "id": None,
-                                 "error": {"code": -32700, "message": "parse error"}})
+            except (ValueError, UnicodeDecodeError):
+                self._rpc_error(None, -32700, "parse error")
+                return
+            if not isinstance(req, dict):
+                self._rpc_error(None, -32600, "invalid request")
                 return
             rid = req.get("id")
-            method = ALIASES.get(req.get("method"), req.get("method"))
-            params = req.get("params") or {}
+            raw = req.get("method")
+            method = ALIASES.get(raw, raw)
+            params = req.get("params") if req.get("params") is not None else {}
+            if not isinstance(params, dict):
+                self._rpc_error(rid, -32602, "params must be an object")
+                return
             try:
                 if method == "SendMessage":
-                    result: Any = {"task": service.send_message(params, peer)}
-                    if req.get("method") == "message/send":
-                        result = dict(result["task"], kind="task")
+                    task = service.send_message(params, peer)
+                    result: Any = dict(task, kind="task") if raw == "message/send" else {"task": task}
                 elif method == "GetTask":
-                    result = service.get_task(params)
+                    result = service.get_task(params, peer)
                 elif method == "ListTasks":
-                    result = service.list_tasks(params)
+                    result = service.list_tasks(params, peer)
                 elif method == "CancelTask":
-                    result = service.cancel_task(params)
+                    result = service.cancel_task(params, peer)
                 elif method in ("SendStreamingMessage", "message/stream", "SubscribeToTask"):
                     raise RpcError(-32004, "streaming is not supported")
                 else:
-                    raise RpcError(-32601, f"method not found: {req.get('method')}")
-                self._send(200, {"jsonrpc": "2.0", "id": rid, "result": result})
+                    raise RpcError(-32601, f"method not found: {raw}")
             except RpcError as exc:
-                self._send(200, {"jsonrpc": "2.0", "id": rid,
-                                 "error": {"code": exc.code, "message": str(exc)}})
+                self._rpc_error(rid, exc.code, str(exc))
+                return
+            self._send(200, {"jsonrpc": "2.0", "id": rid, "result": result})
 
     return Handler
 
@@ -315,7 +368,7 @@ def build_servers(cfg: dict[str, Any] | None = None) -> list[ThreadingHTTPServer
     server_cfg = cfg["server"]
     host = server_cfg.get("host", "127.0.0.1")
     tokens = server_cfg.get("tokens") or {}
-    if host not in ("127.0.0.1", "localhost", "::1") and not tokens:
+    if host not in LOCAL_HOSTS and not tokens:
         raise SystemExit("refusing to listen beyond localhost without a token")
     servers = []
     for name, agent_cfg in server_cfg["agents"].items():

@@ -42,28 +42,31 @@ def conversations() -> dict[str, Any]:
 def conversation(peer: str, name: str, new: bool = False) -> str:
     """Return the contextId for ``peer/name``, creating it when needed."""
     key = f"{peer}/{name}"
-    convs = conversations()
-    if new or key not in convs:
-        convs[key] = {"context_id": f"ctx-{uuid.uuid4().hex}", "created": now(), "turns": 0}
-        config.write_json(_conv_file(), convs)
-    return convs[key]["context_id"]
+    with config.locked(_conv_file()):
+        convs = conversations()
+        if new or key not in convs:
+            convs[key] = {"context_id": f"ctx-{uuid.uuid4().hex}", "created": now(), "turns": 0}
+            config.write_json(_conv_file(), convs)
+        return convs[key]["context_id"]
 
 
 def _touch_conversation(peer: str, name: str) -> None:
     key = f"{peer}/{name}"
-    convs = conversations()
-    if key in convs:
-        convs[key]["turns"] = convs[key].get("turns", 0) + 1
-        convs[key]["last_used"] = now()
-        config.write_json(_conv_file(), convs)
+    with config.locked(_conv_file()):
+        convs = conversations()
+        if key in convs:
+            convs[key]["turns"] = convs[key].get("turns", 0) + 1
+            convs[key]["last_used"] = now()
+            config.write_json(_conv_file(), convs)
 
 
 def forget_conversation(peer: str, name: str) -> bool:
-    convs = conversations()
-    if convs.pop(f"{peer}/{name}", None) is None:
-        return False
-    config.write_json(_conv_file(), convs)
-    return True
+    with config.locked(_conv_file()):
+        convs = conversations()
+        if convs.pop(f"{peer}/{name}", None) is None:
+            return False
+        config.write_json(_conv_file(), convs)
+        return True
 
 
 # --- jobs ----------------------------------------------------------------
@@ -95,7 +98,8 @@ def create_job(peer: str, conversation_name: str, text: str, new: bool = False) 
     if peer not in cfg["peers"]:
         raise A2AError(f"unknown peer '{peer}'. Known: {', '.join(cfg['peers'])}")
     job = {
-        "id": time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3),
+        # Microseconds keep ids in creation order, which _wait_turn relies on.
+        "id": datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + secrets.token_hex(2),
         "peer": peer,
         "conversation": conversation_name,
         "context_id": conversation(peer, conversation_name, new=new),
@@ -130,10 +134,14 @@ def run_job(job_id: str) -> dict[str, Any]:
     job = load_job(job_id)
     if job is None:
         raise A2AError(f"no job {job_id}")
+    # Only this process writes the job from here on; the pid lets readers
+    # notice if it dies, even while it waits for its turn.
+    job["pid"] = os.getpid()
+    save_job(job)
     _wait_turn(job)
     cfg = config.load()
     peer = cfg["peers"][job["peer"]]
-    job.update(status="running", started=now(), pid=os.getpid())
+    job.update(status="running", started=now())
     save_job(job)
     client = Client(peer["url"], config.peer_token(peer), timeout=peer.get("timeout", 900))
     try:
@@ -183,10 +191,7 @@ def spawn_worker(job_id: str) -> int:
     else:
         kwargs["start_new_session"] = True
     proc = subprocess.Popen([sys.executable, "-m", "a2abridge", "_worker", job_id], **kwargs)
-    job = load_job(job_id)
-    if job and job["status"] == "queued" and not job.get("pid"):
-        job["pid"] = proc.pid
-        save_job(job)
+    proc.returncode = 0  # detached on purpose: never waited for, so silence the warning
     return proc.pid
 
 

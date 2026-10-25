@@ -12,6 +12,10 @@ state/
 CLAUDE.md
 AGENTS.md
 GEMINI.md
+MEMORY.md
 .claude/
 .codex/
 .agents/
+.gemini/
+.opencode/
+tests/tmp*/

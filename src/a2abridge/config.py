@@ -7,6 +7,7 @@ grants, contexts). Nothing here is ever part of the repository.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import os
@@ -14,7 +15,7 @@ import secrets
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 PERMISSION_LEVELS = ["read", "workspace", "full"]
 
@@ -45,7 +46,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "model": None,
                 "default_permission": "read",
                 "max_permission": "workspace",
-                "default_workdir": "~",
+                "default_workdir": "~/.a2a-workspace",
                 "workdirs": [],
                 "timeout": 1800,
             },
@@ -58,7 +59,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "model": None,
                 "default_permission": "read",
                 "max_permission": "workspace",
-                "default_workdir": "~",
+                "default_workdir": "~/.a2a-workspace",
                 "workdirs": [],
                 "timeout": 1800,
             },
@@ -143,6 +144,33 @@ def write_json(path: Path, data: Any) -> None:
         except PermissionError:  # Windows: reader holds the file open
             time.sleep(0.05)
     os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def locked(path: Path, timeout: float = 10, stale: float = 30) -> Iterator[None]:
+    """Cross-process lock around a read-modify-write of ``path``."""
+    lock = path.with_name(path.name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + timeout
+    while True:
+        try:
+            os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > stale:
+                    lock.unlink()
+                    continue
+            except FileNotFoundError:
+                continue
+            if time.time() > deadline:
+                raise TimeoutError(f"could not lock {path}")
+            time.sleep(0.02)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            lock.unlink()
 
 
 def peer_token(peer: dict[str, Any]) -> str | None:

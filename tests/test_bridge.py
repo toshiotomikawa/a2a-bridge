@@ -21,6 +21,7 @@ from a2abridge import config, jobs, permissions, server  # noqa: E402
 from a2abridge.client import Client, strip_reasoning  # noqa: E402
 
 TOKEN = "test-token"
+OTHER = "other-token"
 
 
 def free_port() -> int:
@@ -34,7 +35,8 @@ def free_port() -> int:
 class Base(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.tmp = tempfile.TemporaryDirectory()
+        # Not under the system temp folder: AppData is a protected folder.
+        cls.tmp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent)
         os.environ["A2A_HOME"] = cls.tmp.name
         cls.work = Path(cls.tmp.name) / "work"
         cls.work.mkdir()
@@ -43,7 +45,7 @@ class Base(unittest.TestCase):
             "default_peer": "echo",
             "peers": {"echo": {"url": f"http://127.0.0.1:{cls.port}", "token": TOKEN, "timeout": 30}},
             "server": {
-                "tokens": {"tester": TOKEN},
+                "tokens": {"tester": TOKEN, "other": OTHER},
                 "dispatch_log": str(Path(cls.tmp.name) / "dispatch.jsonl"),
                 "agents": {
                     "claude": {"enabled": False},
@@ -121,6 +123,30 @@ class ServerTests(Base):
         with self.assertRaises(Exception):
             self.client().rpc("Nope", {})
 
+    def test_peers_are_isolated(self) -> None:
+        mine = self.client().send("private")
+        other = self.client(token=OTHER)
+        with self.assertRaises(Exception):
+            other.get_task(mine["id"])
+        self.assertEqual(other.rpc("ListTasks", {})["tasks"], [])
+        # Same contextId from another peer is a separate conversation.
+        t = other.send("hello", context_id=mine["contextId"])
+        self.assertIn("#1", t["status"]["message"]["parts"][0]["text"])
+
+    def test_malformed_requests(self) -> None:
+        for body in (b"[]", b"1", b'{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":[]}'):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.port}/", body,
+                {"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                self.assertIn("error", json.load(resp))
+        with self.assertRaises(Exception):
+            self.client().send("[permission: read]")  # directive only, no text
+
+    def test_card_declares_security(self) -> None:
+        self.assertEqual(self.client().card()["security"], [{"bearer": []}])
+
 
 class PermissionTests(Base):
     def tearDown(self) -> None:
@@ -149,6 +175,33 @@ class PermissionTests(Base):
         self.assertEqual(level, "read")
         self.assertTrue(notes)
 
+    def test_read_grant_does_not_unlock_writing(self) -> None:
+        agent = {"max_permission": "workspace", "default_workdir": str(self.work), "workdirs": []}
+        permissions.grant("x", "read", 5, str(self.work))
+        level, _, _ = permissions.resolve("x", agent, "workspace", str(self.work))
+        self.assertEqual(level, "read")
+
+    def test_folder_grant_is_capped_at_its_level(self) -> None:
+        agent = {"max_permission": "full", "default_workdir": str(self.work), "workdirs": []}
+        permissions.grant("x", "workspace", 5, str(self.work))
+        level, _, _ = permissions.resolve("x", agent, "full", str(self.work))
+        self.assertEqual(level, "workspace")
+
+    def test_protected_and_network_folders(self) -> None:
+        agent = {"max_permission": "workspace", "default_workdir": str(self.work),
+                 "workdirs": [str(Path.home())]}
+        for asked in (str(Path.home()), str(Path.home() / ".claude"), r"\\192.0.2.1\share"):
+            level, folder, notes = permissions.resolve("x", agent, "workspace", asked)
+            self.assertEqual(folder, self.work.resolve(), asked)
+            self.assertTrue(notes)
+
+    def test_rejected_folder_keeps_current(self) -> None:
+        agent = {"max_permission": "read", "default_workdir": str(self.work), "workdirs": []}
+        current = self.work / "a"
+        current.mkdir(exist_ok=True)
+        _, folder, _ = permissions.resolve("x", agent, None, str(Path.home()), current=str(current))
+        self.assertEqual(folder, current.resolve())
+
 
 class OutboundTests(Base):
     def test_inline_job_and_conversation(self) -> None:
@@ -170,6 +223,12 @@ class OutboundTests(Base):
         raw = "💭 **Reasoning:**\n```\nthinking\n```\n\nOK"
         self.assertEqual(strip_reasoning(raw), "OK")
         self.assertEqual(strip_reasoning("plain"), "plain")
+        nested = "💭 **Reasoning:**\n```\nplan:\n```python\nx = 1\n```\ndone\n```\n\nAnswer"
+        self.assertEqual(strip_reasoning(nested), "Answer")
+
+    def test_same_second_jobs_keep_order(self) -> None:
+        ids = [jobs.create_job("echo", "order", str(i))["id"] for i in range(5)]
+        self.assertEqual(ids, sorted(ids))
 
 
 class McpTests(Base):
@@ -202,6 +261,7 @@ class McpTests(Base):
         finally:
             proc.stdin.close()
             proc.wait(10)
+            proc.stdout.close()
 
 
 if __name__ == "__main__":

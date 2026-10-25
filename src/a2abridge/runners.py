@@ -7,8 +7,10 @@ the session id to resume next time.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -16,22 +18,31 @@ import threading
 from pathlib import Path
 from typing import Any, Callable
 
-READ_TOOLS = "Read,Grep,Glob,WebSearch,WebFetch,TodoWrite"
-EDIT_TOOLS = READ_TOOLS + ",Edit,Write,MultiEdit,NotebookEdit"
+READ_TOOLS = "Read,Grep,Glob,WebSearch,TodoWrite"
+EDIT_TOOLS = READ_TOOLS + ",Edit,Write,NotebookEdit"
+
+# Below "full", Claude Code runs restricted: only the listed built-in
+# tools, file tools confined to the working folder, no settings files
+# (so no hooks from the folder), no MCP servers, and anything that would
+# need a prompt is denied.
+_CLAUDE_CONFINED = ["--restricted", "--strict-mcp-config", "--permission-prompts", "none"]
 
 CLAUDE_ARGS = {
-    "read": ["--permission-mode", "dontAsk", "--allowedTools", READ_TOOLS],
-    "workspace": [
-        "--permission-mode", "acceptEdits",
-        "--allowedTools", EDIT_TOOLS,
-        "--disallowedTools", "Bash,PowerShell",
-    ],
+    "read": _CLAUDE_CONFINED + ["--permission-mode", "dontAsk",
+                                "--tools", READ_TOOLS, "--allowedTools", READ_TOOLS],
+    "workspace": _CLAUDE_CONFINED + ["--permission-mode", "acceptEdits", "--tools", EDIT_TOOLS],
     "full": ["--dangerously-skip-permissions"],
 }
 
+# Below "full", Codex ignores the user's config.toml: MCP servers and
+# plugins run outside its sandbox, so they must not load. The model and
+# effort from that file are passed on explicitly.
+_CODEX_ISOLATED = ["--ignore-user-config", "--disable", "plugins", "--disable", "apps",
+                   "--disable", "computer_use", "-c", 'approval_policy="never"']
+
 CODEX_ARGS = {
-    "read": ["-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"'],
-    "workspace": ["-c", 'sandbox_mode="workspace-write"', "-c", 'approval_policy="never"'],
+    "read": _CODEX_ISOLATED + ["-c", 'sandbox_mode="read-only"'],
+    "workspace": _CODEX_ISOLATED + ["-c", 'sandbox_mode="workspace-write"'],
     "full": ["--dangerously-bypass-approvals-and-sandbox"],
 }
 
@@ -49,6 +60,7 @@ class Turn:
     def __init__(self) -> None:
         self.proc: subprocess.Popen | None = None
         self.cancelled = False
+        self.stderr = ""
         self._lock = threading.Lock()
 
     def cancel(self) -> None:
@@ -77,11 +89,14 @@ class Turn:
             out, err = self.proc.communicate(stdin, timeout=timeout)
         except subprocess.TimeoutExpired:
             _kill_tree(self.proc)
+            with contextlib.suppress(Exception):
+                self.proc.communicate(timeout=10)  # drain pipes, reap the process
             raise RunError(f"timed out after {timeout:.0f}s")
         if self.cancelled:
             raise RunError("cancelled")
+        self.stderr = err or ""
         if self.proc.returncode != 0 and not out.strip():
-            raise RunError((err or "").strip()[-2000:] or f"exit code {self.proc.returncode}")
+            raise RunError(self.stderr.strip()[-2000:] or f"exit code {self.proc.returncode}")
         return out
 
 
@@ -116,10 +131,29 @@ def run_claude(
     try:
         data = json.loads(out.strip().splitlines()[-1])
     except (json.JSONDecodeError, IndexError) as exc:
-        raise RunError(f"unexpected Claude output: {out[-500:]}") from exc
+        raise RunError(
+            f"unexpected Claude output: {out[-500:]} {turn.stderr.strip()[-500:]}".strip()
+        ) from exc
     if data.get("is_error"):
         raise RunError(str(data.get("result") or data.get("subtype") or "Claude error"))
     return str(data.get("result") or ""), data.get("session_id") or session
+
+
+def _codex_user_model() -> dict[str, str]:
+    """Top-level model and effort from Codex's config.toml, if readable."""
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    out: dict[str, str] = {}
+    try:
+        text = (home / "config.toml").read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        if line.startswith("["):
+            break  # only top-level keys
+        match = re.match(r'^(model|model_reasoning_effort)\s*=\s*"([^"]+)"', line)
+        if match:
+            out[match.group(1)] = match.group(2)
+    return out
 
 
 def run_codex(
@@ -132,9 +166,14 @@ def run_codex(
         if session:
             cmd += ["resume"]
         cmd += ["--json", "--skip-git-repo-check", "-o", last]
-        if cfg.get("model"):
-            cmd += ["-m", cfg["model"]]
-        cmd += (cfg.get("args") or {}).get(level) or CODEX_ARGS[level]
+        level_args = (cfg.get("args") or {}).get(level) or CODEX_ARGS[level]
+        user = _codex_user_model() if "--ignore-user-config" in level_args else {}
+        model = cfg.get("model") or user.get("model")
+        if model:
+            cmd += ["-m", model]
+        if user.get("model_reasoning_effort"):
+            cmd += ["-c", f'model_reasoning_effort="{user["model_reasoning_effort"]}"']
+        cmd += level_args
         if session:
             cmd += [session]
         cmd += ["-"]

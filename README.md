@@ -57,27 +57,41 @@ Some agents put a reasoning block before the answer; it is removed unless the pe
 a2a serve            # claude on 127.0.0.1:9901, codex on 127.0.0.1:9902
 ```
 
-On Windows, `a2aw serve --log <file>` runs it without a console window, which suits a
-login startup entry. Register the two endpoints as peers in the calling agent. For Hermes,
-in its `config.yaml`:
+On Windows, start it at login without a console window with a small `.vbs` file in the
+Startup folder:
+
+```vb
+Set s = CreateObject("WScript.Shell")
+s.Run """<home>\.a2a\.venv\Scripts\a2a.exe"" serve --log ""<home>\.a2a\serve.log""", 0, False
+```
+
+Register the two endpoints as peers in the calling agent. For Hermes, put the server token
+from `~/.a2a/config.json` in its `.env` (for example `A2A_BRIDGE_TOKEN=...`) and reference it
+from `config.yaml`:
 
 ```yaml
 a2a_agents:
   claude:
     url: "http://127.0.0.1:9901"
-    auth: { type: bearer, token: "<server token from ~/.a2a/config.json>" }
+    auth: { type: bearer, token: "${A2A_BRIDGE_TOKEN}" }
     timeout: 1800
     capabilities: [coding, review]
   codex:
     url: "http://127.0.0.1:9902"
-    auth: { type: bearer, token: "<same token>" }
+    auth: { type: bearer, token: "${A2A_BRIDGE_TOKEN}" }
     timeout: 1800
     capabilities: [coding, review]
 ```
 
+To require a token on the Hermes side too, set `A2A_PEER_TOKENS="a2a-bridge:<token>"` in
+its `.env` and the same token as the peer's `token` in `~/.a2a/config.json`.
+
 Each A2A `contextId` maps to one Claude Code session or Codex thread, so follow-up messages
-continue the same conversation. Methods: `SendMessage` (blocking, or `returnImmediately`),
-`GetTask`, `ListTasks`, `CancelTask`, plus the pre-1.0 aliases.
+continue the same conversation. Tasks and conversations belong to the peer (token) that
+created them: another peer can neither list, read, cancel nor continue them. If a saved
+session can no longer be resumed, the next turn starts a fresh one and says so. Methods:
+`SendMessage` (blocking, or `returnImmediately`), `GetTask`, `ListTasks`, `CancelTask`, plus
+the pre-1.0 aliases.
 
 ### Permissions
 
@@ -85,13 +99,26 @@ There are three levels:
 
 | Level | Claude Code | Codex |
 | --- | --- | --- |
-| `read` | read, search and web tools only | `read-only` sandbox |
-| `workspace` | may edit files in the folder, no shell | `workspace-write` sandbox |
+| `read` | `--restricted`: read and search tools, confined to the folder | `read-only` sandbox |
+| `workspace` | `--restricted`: may also edit files in the folder, no shell | `workspace-write` sandbox |
 | `full` | `--dangerously-skip-permissions` | no sandbox, no approvals |
 
-Per agent, `default_permission` applies when a request asks for nothing, `max_permission` is
-the ceiling, and `workdirs` lists the folders where anything above `read` is allowed. A request
-asks for a level and folder with metadata (`permission`, `workdir`) or with leading lines:
+Below `full`, Claude Code runs with `--restricted --strict-mcp-config --permission-prompts
+none`: file tools stay inside the working folder, no settings files (so no hooks planted in
+the folder) and no MCP servers load, and anything that would ask is denied. Codex runs with
+`--ignore-user-config` and plugins, apps and computer use disabled, because MCP servers and
+plugins run outside its sandbox; the model and effort from `config.toml` are passed on. Codex's
+`read-only` sandbox still lets its shell read any file the user can read, so treat `read` on
+Codex as "no writes", not "no reading".
+
+Per agent, `default_permission` applies when a request asks for nothing. `max_permission` is
+the ceiling inside the folders listed in `workdirs`; anywhere else the ceiling is `read`.
+`default_workdir` (default `~/.a2a-workspace`) is used when a request names no folder.
+Folders holding agent or system configuration (`~/.a2a`, `~/.claude`, `~/.codex`,
+`~/.gemini`, `~/.config`, `~/.ssh`, `~/AppData`, PowerShell profiles), any folder that
+contains one (such as the home folder), and network paths are never used below `full`; the
+conversation keeps its current folder instead. A request asks for a level and folder with
+metadata (`permission`, `workdir`) or with leading lines:
 
 ```text
 [permission: workspace]
@@ -99,8 +126,9 @@ asks for a level and folder with metadata (`permission`, `workdir`) or with lead
 Fix the broken links in the docs folder.
 ```
 
-It gets the lower of what it asked and what is allowed, and the reply says when it was lowered.
-The owner raises the ceiling for a while from the PC's own terminal:
+It gets the lower of what it asked and what that folder allows, and the reply says when it
+was lowered. The owner raises the ceiling for a while from the PC's own terminal; a folder
+grant applies only to that folder and only up to its level:
 
 ```bash
 a2a grant claude workspace --dir C:\Projects\site --minutes 60
@@ -121,6 +149,8 @@ Optional: `server.dispatch_log` appends one JSON line per new child session
 - With tokens set, every request needs `Authorization: Bearer <token>`; the token's name is
   the peer identity shown to the local agent.
 - Inbound text is framed as a message from a peer, with the granted level and folder.
+- Requests are capped at 1 MB, sockets time out after 30 seconds, and malformed JSON-RPC
+  gets an error reply.
 
 ## Tests
 
