@@ -190,7 +190,8 @@ class PermissionTests(Base):
     def test_protected_and_network_folders(self) -> None:
         agent = {"max_permission": "workspace", "default_workdir": str(self.work),
                  "workdirs": [str(Path.home())]}
-        for asked in (str(Path.home()), str(Path.home() / ".claude"), r"\\192.0.2.1\share"):
+        for asked in (str(Path.home()), str(Path.home() / ".claude"), r"\\192.0.2.1\share",
+                      r" \/192.0.2.1\share", "/\\192.0.2.1/share"):
             level, folder, notes = permissions.resolve("x", agent, "workspace", asked)
             self.assertEqual(folder, self.work.resolve(), asked)
             self.assertTrue(notes)
@@ -200,6 +201,10 @@ class PermissionTests(Base):
         current = self.work / "a"
         current.mkdir(exist_ok=True)
         _, folder, _ = permissions.resolve("x", agent, None, str(Path.home()), current=str(current))
+        self.assertEqual(folder, current.resolve())
+        # Asking for full in a protected folder without a full grant also keeps it.
+        _, folder, _ = permissions.resolve("x", agent, "full", str(Path.home() / ".claude"),
+                                           current=str(current))
         self.assertEqual(folder, current.resolve())
 
 

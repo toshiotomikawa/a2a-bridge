@@ -113,7 +113,8 @@ def is_protected(folder: Path) -> bool:
 
 def _is_remote(path: str) -> bool:
     # UNC paths make Windows try SMB sign-in to the named host on access.
-    return path.startswith("\\\\") or path.startswith("//")
+    # Windows reads any mix of two leading slashes as UNC.
+    return path.lstrip().replace("/", "\\").startswith("\\\\")
 
 
 def ceiling(agent: str, agent_cfg: dict[str, Any], folder: Path) -> int:
@@ -155,7 +156,7 @@ def resolve(
             asked = _resolve(workdir)
             if not asked.is_dir():
                 notes.append(f"folder {asked} does not exist; using {folder}")
-            elif is_protected(asked) and rank(level) < rank("full"):
+            elif is_protected(asked) and min(rank(level), ceiling(agent, agent_cfg, asked)) < rank("full"):
                 notes.append(f"folder {asked} holds configuration; using {folder}")
             else:
                 folder = asked
