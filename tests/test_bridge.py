@@ -57,6 +57,9 @@ class Base(unittest.TestCase):
                         "max_permission": "workspace",
                         "default_workdir": str(cls.work),
                         "workdirs": [str(cls.work)],
+                        "window": {"argv": [sys.executable, "-c",
+                                            "import sys; print('window', sys.argv[1], 'DONE', sys.argv[2])",
+                                            "{target}", "{id}"]},
                     },
                 },
             },
@@ -146,6 +149,66 @@ class ServerTests(Base):
 
     def test_card_declares_security(self) -> None:
         self.assertEqual(self.client().card()["security"], [{"bearer": []}])
+
+    def test_window_mode_needs_full(self) -> None:
+        c = self.client()
+        t = c.send("[mode: window]\n[target: W1]\nhello")
+        text = t["status"]["message"]["parts"][0]["text"]
+        self.assertIn("window mode needs 'full'", text)
+        self.assertIn("echo[read", text)
+        permissions.grant("echo", "full", 5)
+        try:
+            t = c.send("[permission: full]\n[mode: window]\n[target: W1]\nhello")
+            self.assertEqual(t["status"]["message"]["parts"][0]["text"], "window W1")
+            self.assertEqual(t["metadata"]["mode"], "window")
+            # The same conversation keeps its window.
+            t = c.send("[permission: full]\n[mode: window]\nagain", context_id=t["contextId"])
+            self.assertEqual(t["status"]["message"]["parts"][0]["text"], "window W1")
+        finally:
+            permissions.revoke("echo")
+
+
+class GuardTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        os.environ.update(A2A_GUARD_ROOT=str(self.root), A2A_GUARD_LEVEL="workspace")
+
+    def tearDown(self) -> None:
+        for key in ("A2A_GUARD_ROOT", "A2A_GUARD_LEVEL"):
+            os.environ.pop(key, None)
+        self.root.rmdir()
+
+    def check(self, tool: str, **tool_input: object) -> str | None:
+        from a2abridge import grok_guard
+
+        return grok_guard.decide({"toolName": tool, "toolInput": tool_input, "cwd": str(self.root)})
+
+    def test_inside_is_allowed(self) -> None:
+        self.assertIsNone(self.check("write", file_path="made.txt", content="hi"))
+        self.assertIsNone(self.check("list_dir", target_directory=str(self.root)))
+        self.assertIsNone(self.check("grep", pattern="C:/Users/anything"))
+
+    def test_outside_and_other_tools_are_denied(self) -> None:
+        self.assertTrue(self.check("write", file_path=str(self.root.parent / "x.txt")))
+        self.assertTrue(self.check("read_file", target_file="../x.txt"))
+        self.assertTrue(self.check("read_file", target_file=r"\\192.0.2.1\share\x"))
+        self.assertTrue(self.check("list_dir", glob_pattern=str(self.root.parent / "*")))
+        self.assertTrue(self.check("run_terminal_command", command="echo hi"))
+        self.assertTrue(self.check("github__search", query="x"))
+
+    def test_read_level_and_missing_setup(self) -> None:
+        os.environ["A2A_GUARD_LEVEL"] = "read"
+        self.assertTrue(self.check("write", file_path="made.txt"))
+        self.assertIsNone(self.check("read_file", target_file="made.txt"))
+        os.environ.pop("A2A_GUARD_ROOT")
+        self.assertTrue(self.check("read_file", target_file="made.txt"))
+
+    def test_hook_denies_on_bad_input(self) -> None:
+        guard = SRC / "a2abridge" / "grok_guard.py"
+        proc = subprocess.run([sys.executable, "-I", str(guard)], input="not json\n",
+                              capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(json.loads(proc.stdout)["decision"], "deny")
 
 
 class PermissionTests(Base):

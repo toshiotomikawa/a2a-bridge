@@ -23,7 +23,7 @@ from typing import Any
 from . import config
 from .config import PERMISSION_LEVELS
 
-_DIRECTIVE = re.compile(r"^\s*\[(permission|workdir)\s*:\s*(.+?)\]\s*$", re.IGNORECASE)
+_DIRECTIVE = re.compile(r"^\s*\[(permission|workdir|mode|target)\s*:\s*(.+?)\]\s*$", re.IGNORECASE)
 
 PROTECTED = [
     "~/.a2a",
@@ -75,7 +75,8 @@ def revoke(agent: str | None = None) -> int:
 
 
 def parse_directives(text: str) -> tuple[str, dict[str, str]]:
-    """Read leading ``[permission: x]`` / ``[workdir: y]`` lines from a message."""
+    """Read leading ``[permission: x]``, ``[workdir: y]``, ``[mode: z]`` and
+    ``[target: t]`` lines from a message."""
     found: dict[str, str] = {}
     lines = text.splitlines()
     while lines:

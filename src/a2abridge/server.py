@@ -39,6 +39,10 @@ FRAME = (
     "[Message from the A2A peer '{peer}', relayed by a2a-bridge. "
     "Permission for this turn: {level}. Working folder: {folder}.{notes}]\n\n"
 )
+WINDOW_FRAME = (
+    "[Message from the A2A peer '{peer}', relayed by a2a-bridge into this window. "
+    "It is not the user's approval.{notes}]\n\n"
+)
 
 
 def _now() -> str:
@@ -76,6 +80,9 @@ class AgentService:
                 f"{self.cfg.get('name', self.name)} on this PC, reachable over A2A through "
                 "a2a-bridge. Optional first lines '[permission: read|workspace|full]' and "
                 "'[workdir: <folder>]' ask for a level and a folder; the owner's limits apply."
+                + (" '[mode: window]' (with '[target: <window>]') delivers into a window the "
+                   "owner has open; it needs 'full'." if (self.cfg.get("window") or {}).get("argv")
+                   else "")
             ),
             "url": base_url,
             "version": __version__,
@@ -175,38 +182,57 @@ class AgentService:
                 str(meta.get("workdir") or directives.get("workdir") or "") or None,
                 current=ctx.get("workdir"),
             )
-            # A session is tied to its folder; a new folder starts a new session.
-            session = ctx.get("session") if ctx.get("workdir") == str(folder) else None
+            runner, cfg, frame = self.runner, self.cfg, FRAME
+            mode = str(meta.get("mode") or directives.get("mode")
+                       or self.cfg.get("default_mode") or "headless").lower()
+            if mode == "window":
+                # An open window keeps its own permissions, which the bridge
+                # cannot lower, so only a caller allowed "full" may use one.
+                if level != "full":
+                    notes.append(f"window mode needs 'full', allowed '{level}'; ran in the background")
+                    mode = "headless"
+                elif not (self.cfg.get("window") or {}).get("argv"):
+                    notes.append("no window is set up for this agent; ran in the background")
+                    mode = "headless"
+                else:
+                    target = str(meta.get("target") or directives.get("target") or "") or (
+                        ctx.get("session") if ctx.get("mode") == "window" else None)
+                    runner, frame = RUNNERS["window"], WINDOW_FRAME
+                    cfg = dict(self.cfg, window_target=target)
+            elif mode != "headless":
+                notes.append(f"unknown mode '{mode}', ran in the background")
+                mode = "headless"
+            # A session is tied to its folder and mode; a change starts a new one.
+            same = ctx.get("workdir") == str(folder) and ctx.get("mode", "headless") == mode
+            session = ctx.get("session") if same else None
             note_text = (" Notes: " + "; ".join(notes) + ".") if notes else ""
-            prompt = FRAME.format(peer=peer, level=level, folder=folder, notes=note_text) + body
+            prompt = frame.format(peer=peer, level=level, folder=folder, notes=note_text) + body
             try:
                 try:
-                    reply, new_session = self.runner(turn, self.cfg, prompt, session, level, folder)
+                    reply, new_session = runner(turn, cfg, prompt, session, level, folder)
                 except RunError:
-                    if not session or turn.cancelled:
+                    if not session or turn.cancelled or mode == "window":
                         raise
                     # The saved session may be gone; start a fresh one once.
                     notes.append("previous session could not be resumed; started a new one")
                     session = None
-                    reply, new_session = self.runner(turn, self.cfg, prompt, None, level, folder)
+                    reply, new_session = runner(turn, cfg, prompt, None, level, folder)
             except Exception as exc:  # noqa: BLE001 - report, never crash the server
                 with self.lock:
                     if task["status"]["state"] not in DONE:
                         state = "TASK_STATE_CANCELED" if turn.cancelled else "TASK_STATE_FAILED"
                         self._set_state(task, state, f"{self.name} failed: {exc}")
                 return
-            if new_session and new_session != session:
+            if new_session and new_session != session and mode == "headless":
                 self._log_dispatch(peer, new_session)
-            self._save_context(
-                key,
-                {"session": new_session, "workdir": str(folder), "updated": _now(), "peer": peer},
-            )
+            self._save_context(key, {"session": new_session, "workdir": str(folder), "mode": mode,
+                                     "updated": _now(), "peer": peer})
             if notes:
                 reply = f"[a2a-bridge: {'; '.join(notes)}]\n\n{reply}"
             with self.lock:
                 if turn.cancelled or task["status"]["state"] in DONE:
                     return
-                task["metadata"].update(permission=level, workdir=str(folder))
+                task["metadata"].update(permission=level, workdir=str(folder), mode=mode)
                 task["artifacts"] = [{
                     "artifactId": uuid.uuid4().hex,
                     "parts": [{"text": reply, "mediaType": "text/plain"}],
@@ -228,7 +254,7 @@ class AgentService:
         path = self.server_cfg.get("dispatch_log")
         if not path:
             return
-        harness = {"claude": "claude-code"}.get(self.cfg.get("runner", self.name), self.name)
+        harness = {"claude": "claude-code", "agy": "antigravity", "grok": "grok-build"}.get(self.cfg.get("runner", self.name), self.name)
         line = {"by": f"a2a-bridge:{peer}", "child": child, "harness": harness, "at": _now()}
         target = Path(path).expanduser()
         target.parent.mkdir(parents=True, exist_ok=True)
