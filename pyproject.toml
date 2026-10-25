@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "a2a-bridge"
+version = "0.1.0"
+description = "Local A2A v1.0 bridge: lets coding agents (Claude Code, Codex, any CLI) talk to an A2A agent such as Hermes, and lets that agent call them back."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+[project.scripts]
+a2a = "a2abridge.cli:main"
+
+[project.gui-scripts]
+a2aw = "a2abridge.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/a2abridge"]

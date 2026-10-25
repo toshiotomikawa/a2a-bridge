@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.env
+config.json
+state/
+*.log
+# Agent instruction files stay out of this repository.
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.claude/
+.codex/
+.agents/
