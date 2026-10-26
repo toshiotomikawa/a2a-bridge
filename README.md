@@ -125,16 +125,21 @@ The other three have no single switch for this, so below `full` each runs isolat
   `--mode accept-edits`. Refused actions are listed in the reply.
 - **OpenCode** gets an inline config (`OPENCODE_CONFIG_CONTENT`, which outranks the user's)
   that denies every tool except reading, searching and, for `workspace`, editing inside the
-  folder; `.env` files and OpenCode's own config stay off limits. It runs `--standalone`.
+  folder; `.env` files and OpenCode's own config stay off limits. It runs `--standalone`,
+  and the folder's own OpenCode config, agents and plugins (which run as code) and Claude Code
+  compatibility files are not loaded.
 - **Grok Build**'s permission modes do not keep writes inside the folder on Windows, and its
   sandbox is Linux and macOS only. Below `full` it runs from `~/.a2a/isolated/grok` (no user
   config, plugins, memory, or Claude, Cursor and Codex hooks, skills and MCP servers) with a
   `PreToolUse` hook, `grok_guard.py`, that denies every tool but reading and, for `workspace`,
-  editing inside the folder. The hook denies on any error of its own. Deny rules for the shell,
+  editing inside the folder, never into agent or git configuration (`.git`, `.grok`, `.claude`,
+  `.opencode` and the like), `.env` files or `opencode.json`. The hook denies on any error of
+  its own. Deny rules for the shell,
   MCP, web fetch and the protected folders back it up.
 
-A change of level starts a new Antigravity or Grok Build conversation, because each level
-keeps its conversations in its own home.
+A change of level starts a new Antigravity, OpenCode or Grok Build conversation: Antigravity
+and Grok Build keep each level's conversations in its own home, and an OpenCode session keeps
+the permissions approved in it.
 
 ### Open windows
 

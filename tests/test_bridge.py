@@ -203,6 +203,30 @@ class GuardTests(unittest.TestCase):
         os.environ.pop("A2A_GUARD_ROOT")
         self.assertTrue(self.check("read_file", target_file="made.txt"))
 
+    def test_control_files_drive_relative_and_grep_glob(self) -> None:
+        for name in (".git/config", ".grok/hooks/x.json", ".opencode/plugins/x.js", ".env",
+                     ".env.local", "opencode.json", "sub/.claude/settings.json"):
+            self.assertTrue(self.check("write", file_path=name, content="x"), name)
+        self.assertIsNone(self.check("read_file", target_file=".env.example.txt"))
+        self.assertTrue(self.check("read_file", target_file="C:foo.txt"))
+        self.assertIsNone(self.check("grep", pattern="x", glob="/*.py"))
+        self.assertTrue(self.check("grep", pattern="x", glob="../*.py"))
+
+    def test_hook_reads_utf8_paths(self) -> None:
+        folder = self.root / "relatório"
+        folder.mkdir()
+        try:
+            event = {"toolName": "write", "cwd": str(folder),
+                     "toolInput": {"file_path": str(folder / "ação.txt"), "content": "ok"}}
+            guard = SRC / "a2abridge" / "grok_guard.py"
+            env = dict(os.environ, A2A_GUARD_ROOT=str(folder))
+            proc = subprocess.run([sys.executable, "-I", str(guard)], env=env, timeout=30,
+                                  input=(json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"),
+                                  capture_output=True)
+            self.assertEqual(json.loads(proc.stdout)["decision"], "allow", proc.stdout)
+        finally:
+            folder.rmdir()
+
     def test_hook_denies_on_bad_input(self) -> None:
         guard = SRC / "a2abridge" / "grok_guard.py"
         proc = subprocess.run([sys.executable, "-I", str(guard)], input="not json\n",

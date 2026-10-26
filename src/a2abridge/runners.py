@@ -321,34 +321,42 @@ def run_agy(
 
 # OpenCode takes an inline config that outranks the user's: below "full"
 # every tool is denied except reading (and, for "workspace", editing)
-# inside the working folder; its own config files stay off limits.
-_OC_BASE = {"*": "deny", "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny"},
+# inside the working folder; its own config files stay off limits. The
+# folder's own OpenCode config, agents and plugins (plugins run as code)
+# and Claude Code compatibility files are not loaded.
+_ENV_FILES = {"*.env": "deny", "*.env.*": "deny"}
+_OC_BASE = {"*": "deny", "read": {"*": "allow", **_ENV_FILES},
             "glob": "allow", "grep": "allow", "list": "allow", "todowrite": "allow",
             "external_directory": "deny", "task": "deny", "question": "deny"}
 OPENCODE_PERMISSION = {
     "read": _OC_BASE,
-    "workspace": {**_OC_BASE,
-                  "edit": {"*": "allow", "*opencode.json*": "deny", "*.opencode*": "deny"}},
+    "workspace": {**_OC_BASE, "edit": {"*": "allow", **_ENV_FILES, "*opencode.json*": "deny",
+                                       "*.opencode*": "deny"}},
 }
+_OC_ISOLATED = {"OPENCODE_DISABLE_PROJECT_CONFIG": "1", "OPENCODE_DISABLE_CLAUDE_CODE": "1"}
 
 
 def run_opencode(
     turn: Turn, cfg: dict[str, Any], prompt: str, session: str | None, level: str, cwd: Path
 ) -> tuple[str, str | None]:
+    # A session keeps permissions approved in it, so one level never
+    # resumes another level's session.
+    resume = _level_session(session, level)
     cmd = [_real_exe(cfg.get("command") or "opencode"), "run", "--standalone", "--format", "json"]
     if cfg.get("model"):
         cmd += ["-m", cfg["model"]]
-    if session:
-        cmd += ["--session", session]
+    if resume:
+        cmd += ["--session", resume]
     env = None
     if level == "full":
         cmd += (cfg.get("args") or {}).get(level) or ["--auto"]
     else:
         cmd += (cfg.get("args") or {}).get(level) or []
-        env = {"OPENCODE_CONFIG_CONTENT": json.dumps({"permission": OPENCODE_PERMISSION[level]})}
+        env = {**_OC_ISOLATED,
+               "OPENCODE_CONFIG_CONTENT": json.dumps({"permission": OPENCODE_PERMISSION[level]})}
     cmd += [_arg_prompt(prompt)]
     out = turn.run(cmd, "", cwd, cfg.get("timeout", 1800), env)
-    texts, errors, sid = [], [], session
+    texts, errors, sid = [], [], resume
     for line in out.splitlines():
         try:
             event = json.loads(line)
@@ -362,7 +370,7 @@ def run_opencode(
     reply = "".join(texts).strip()
     if not reply:
         raise RunError("; ".join(errors) or f"OpenCode returned no reply {turn.stderr.strip()[-500:]}")
-    return reply, sid
+    return reply, f"{level}:{sid}" if sid else None
 
 
 # Grok Build's permission modes and allow rules do not keep writes in the
@@ -375,8 +383,13 @@ def run_opencode(
 _GROK_ENV = {"GROK_MEMORY": "0", "GROK_DISABLE_AUTOUPDATER": "1"} | {
     f"GROK_{vendor}_{part}_ENABLED": "0"
     for vendor in ("CLAUDE", "CURSOR", "CODEX")
-    for part in ("MCPS", "HOOKS", "SKILLS", "AGENTS")
+    for part in ("MCPS", "HOOKS", "SKILLS", "AGENTS", "RULES")
 }
+_GROK_COMPAT = "".join(
+    f"\n[compat.{vendor}]\n" + "".join(f"{cell} = false\n" for cell in
+                                       ("skills", "rules", "agents", "mcps", "hooks", "sessions"))
+    for vendor in ("claude", "cursor")
+)
 
 GROK_CONFIG = """[cli]
 use_leader = false
@@ -395,9 +408,9 @@ official_marketplace_auto_installed = true
 
 [[hooks.PreToolUse]]
 hooks = [
-  {{ type = "command", command = {python}, args = ["-I", {guard}], timeout = 20 }},
+  {{ type = "command", command = {python}, args = ["-I", "-X", "utf8", {guard}], timeout = 20 }},
 ]
-"""
+""" + _GROK_COMPAT
 
 
 def _grok_deny() -> list[str]:
