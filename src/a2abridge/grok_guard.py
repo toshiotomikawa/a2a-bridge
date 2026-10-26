@@ -47,6 +47,8 @@ def _resolve(path: str, cwd: Path) -> Path | None:
     p = Path(path).expanduser()
     if p.drive and not p.root:  # "C:foo" means a folder of drive C:, not of cwd
         return None
+    if ":" in path[len(p.drive):]:  # "x.txt::$DATA" names an NTFS stream
+        return None
     return (p if p.is_absolute() else cwd / p).resolve()
 
 
@@ -65,8 +67,10 @@ def _is_control(path: str, root: Path, cwd: Path) -> bool:
     p = _resolve(path, cwd)
     if p is None:
         return True
-    name = p.name.lower()
-    return (any(part.lower() in CONTROL_DIRS for part in p.relative_to(root).parts)
+    # Windows drops trailing dots and spaces, so ".grok." and ".env " are ".grok" and ".env".
+    parts = [part.lower().rstrip(". ") for part in p.relative_to(root).parts]
+    name = parts[-1] if parts else ""
+    return (any(part in CONTROL_DIRS for part in parts)
             or name == ".env" or name.startswith(".env.") or name.startswith("opencode.json"))
 
 

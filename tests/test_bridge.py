@@ -205,7 +205,8 @@ class GuardTests(unittest.TestCase):
 
     def test_control_files_drive_relative_and_grep_glob(self) -> None:
         for name in (".git/config", ".grok/hooks/x.json", ".opencode/plugins/x.js", ".env",
-                     ".env.local", "opencode.json", "sub/.claude/settings.json"):
+                     ".env.local", "opencode.json", "sub/.claude/settings.json",
+                     ".grok./hooks/x.json", ".env ", ".env::$DATA", "a.txt:x"):
             self.assertTrue(self.check("write", file_path=name, content="x"), name)
         self.assertIsNone(self.check("read_file", target_file=".env.example.txt"))
         self.assertTrue(self.check("read_file", target_file="C:foo.txt"))
